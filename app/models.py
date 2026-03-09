@@ -150,3 +150,68 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     org_unit = db.relationship("OrgUnit", foreign_keys=[org_unit_id], lazy="joined")
     org_unit_job_position = db.relationship("OrgUnitJobPosition", foreign_keys=[org_unit_job_position_id], lazy="joined")
+
+    # NEW: Normalized job title reference
+    job_title_id = db.Column(db.Integer, db.ForeignKey("job_title.id"), nullable=True, index=True)
+    job_title_ref = db.relationship("JobTitle", lazy="joined", foreign_keys=[job_title_id], overlaps="job_title_object")
+
+    def to_dict(self, include_org_unit=True):
+        """
+        Serialize User to dict for API responses.
+        Includes both legacy job_title field and new job_title_id/job_title_name.
+        
+        Args:
+            include_org_unit: whether to include full org_unit object (default True)
+        """
+        data = {
+            "id": self.id,
+            "username": self.username,
+            "full_name": self.full_name,
+            "email": self.email,
+            "phone": self.phone,
+            "gender": self.gender,
+            "birth_date": self.birth_date.isoformat() if self.birth_date else None,
+            "job_title": self.job_title,  # LEGACY: keep for backward compatibility
+            "job_title_id": self.job_title_id,  # NEW
+            "job_title_name": self.job_title_ref.name if self.job_title_ref else None,  # NEW
+            "role": self.role.value,
+            "is_active": getattr(self, "is_active", True),
+            "org_unit_id": self.org_unit_id,
+        }
+        
+        if include_org_unit:
+            data["org_unit"] = self.org_unit.to_dict() if self.org_unit else None
+        
+        return data
+
+
+# 4) CHỨC DANH CHI TIẾT (Normalized JobTitle)
+class JobTitle(db.Model):
+    __tablename__ = "job_title"
+
+    id = db.Column(db.Integer, primary_key=True)
+    code = db.Column(db.String(50), unique=True, nullable=False, index=True)
+    name = db.Column(db.String(150), unique=True, nullable=False)
+    level_no = db.Column(db.Integer, nullable=False, default=1)
+    is_manager = db.Column(db.Boolean, nullable=False, default=False)
+
+    # Data scope: 'all', 'subtree', 'unit', 'self'
+    data_scope = db.Column(db.String(20), nullable=False, default="self")
+
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    # Relationship back to users who hold this job title
+    users = db.relationship("User", backref="job_title_object", foreign_keys="User.job_title_id", lazy="dynamic", overlaps="job_title_ref")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "code": self.code,
+            "name": self.name,
+            "level_no": self.level_no,
+            "is_manager": self.is_manager,
+            "data_scope": self.data_scope,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }

@@ -1,133 +1,198 @@
-from flask import Blueprint, request, jsonify
-from werkzeug.security import generate_password_hash
+from datetime import datetime
+
+from flask import Blueprint, jsonify, request
 from sqlalchemy.exc import DataError
+from werkzeug.security import generate_password_hash
+from flask_jwt_extended import jwt_required
+
+from app.decorators import admin_required, manager_required
 from app.extensions import db
-from app.models import User, UserRole, OrgUnit
-from app.decorators import admin_required
+from app.models import JobTitle, OrgUnit, User, UserRole
+
 
 admin_users_bp = Blueprint("admin_users_bp", __name__)
 
+
 def parse_parent_id(data):
-    """
-    Chuẩn hóa parent_id:
-    - None / "" / thiếu -> None
-    - 0 / "0" -> None (root)
-    - "5"/5 -> 5
-    """
     if not data:
         return None
 
-    pid = data.get("parent_id", None)
-
+    pid = data.get("parent_id")
     if pid is None or pid == "":
         return None
 
     try:
         pid_int = int(pid)
-    except (ValueError, TypeError):
+    except (TypeError, ValueError):
         return None
 
-    if pid_int == 0:
+    return None if pid_int == 0 else pid_int
+
+
+def parse_birth_date(raw_value):
+    if raw_value in (None, ""):
         return None
+    if isinstance(raw_value, str):
+        try:
+            return datetime.strptime(raw_value.strip(), "%Y-%m-%d").date()
+        except ValueError:
+            return "__invalid__"
+    return "__invalid__"
 
-    return pid_int
 
-# [GET] Lấy danh sách user
-@admin_users_bp.get("/users") # Đảm bảo đường dẫn này khớp với frontend gọi
+@admin_users_bp.get("/users")
 @admin_required
 def list_users():
     users = User.query.order_by(User.id.desc()).all()
-    return jsonify([{
-        "id": u.id,
-        "username": u.username,
-        "full_name": u.full_name,
-        "email": u.email,
-        "phone": u.phone,
-        "gender": u.gender,
-        "birth_date": u.birth_date.isoformat() if u.birth_date else None,
-        "job_title": getattr(u, "job_title", None),
-        "role": u.role.value,
-        "is_active": getattr(u, "is_active", True),
+    return (
+        jsonify([u.to_dict() for u in users]),
+        200,
+    )
 
-        # ✅ trả luôn phòng ban để drawer dùng person.org_unit?.name
-        "org_unit_id": u.org_unit_id,
-        "org_unit": u.org_unit.to_dict() if getattr(u, "org_unit", None) else None,
-    } for u in users]), 200
 
-# [POST] Tạo user mới
+@admin_users_bp.get("/job-titles")
+@admin_required
+def list_job_titles():
+    """
+    API để lấy danh sách chức danh cho dropdown trong form chỉnh sửa user.
+    Chỉ trả về các job_title đang active.
+    """
+    job_titles = JobTitle.query.filter_by(is_active=True).order_by(JobTitle.level_no.desc(), JobTitle.name.asc()).all()
+    return jsonify([jt.to_dict() for jt in job_titles]), 200
+
+
 @admin_users_bp.post("/users")
 @admin_required
 def create_user():
     data = request.get_json() or {}
     username = data.get("username")
     password = data.get("password")
-    
     if not username or not password:
-        return jsonify({"msg": "Username và mật khẩu không được trống"}), 400
-    
-    if User.query.filter_by(username=username).first():
-        return jsonify({"msg": "Username đã tồn tại"}), 400
+        return jsonify({"msg": "Username va mat khau khong duoc trong"}), 400
 
-    u = User(
+    if User.query.filter_by(username=username).first():
+        return jsonify({"msg": "Username da ton tai"}), 400
+
+    user = User(
         username=username,
         password_hash=generate_password_hash(password),
         full_name=data.get("full_name"),
         email=data.get("email"),
-        role=UserRole.from_any(data.get("role", "user"))
+        role=UserRole.from_any(data.get("role", "user")),
     )
-    db.session.add(u)
+
+    # Handle job_title_id if provided
+    if "job_title_id" in data and data.get("job_title_id"):
+        try:
+            job_title_id = int(data.get("job_title_id"))
+            job_title = JobTitle.query.filter_by(id=job_title_id, is_active=True).first()
+            if job_title:
+                user.job_title_id = job_title_id
+                user.job_title = job_title.name
+                # Auto-set role based on job title
+                if job_title.is_manager:
+                    user.role = UserRole.MANAGER
+        except (TypeError, ValueError):
+            pass
+
+    db.session.add(user)
     try:
         db.session.commit()
     except DataError:
         db.session.rollback()
-        return jsonify({"msg": "Role khong tuong thich voi schema DB hien tai. Hay chay migration moi nhat."}), 400
-    return jsonify({"msg": "Đã tạo user"}), 201
+        return jsonify({"msg": "Du lieu khong hop le hoac khong tuong thich schema DB"}), 400
 
-# [PUT] Cập nhật user
-@admin_users_bp.route("/users/<int:user_id>", methods=["PUT"])
+    return jsonify({"msg": "Da tao user"}), 201
+
+
+@admin_users_bp.put("/users/<int:user_id>")
 @admin_required
 def update_user(user_id):
-    u = User.query.get_or_404(user_id)
+    user = User.query.get_or_404(user_id)
     data = request.get_json() or {}
 
-    # Cập nhật mọi trường có trong Model
-    u.full_name = data.get("full_name", u.full_name)
-    u.email = data.get("email", u.email)
-    u.phone = data.get("phone", u.phone)
-    u.gender = data.get("gender", u.gender)
-    u.birth_date = data.get("birth_date", u.birth_date) # YYYY-MM-DD
-    u.job_title = data.get("job_title", u.job_title)
+    user.full_name = data.get("full_name", user.full_name)
+    user.email = data.get("email", user.email)
+    user.phone = data.get("phone", user.phone)
+    user.gender = data.get("gender", user.gender)
+    user.job_title = data.get("job_title", user.job_title)
+
+    # Xử lý job_title_id (mới) - cho dropdown selection
+    if "job_title_id" in data:
+        raw_job_title_id = data.get("job_title_id")
+        if raw_job_title_id in (None, ""):
+            user.job_title_id = None
+        else:
+            try:
+                job_title_id = int(raw_job_title_id)
+            except (TypeError, ValueError):
+                return jsonify({"msg": "job_title_id khong hop le"}), 400
+            
+            # Validate job_title exists and is active
+            job_title = JobTitle.query.filter_by(id=job_title_id, is_active=True).first()
+            if not job_title:
+                return jsonify({"msg": "Chuc danh khong ton tai hoac da bi vo hieu hoa"}), 400
+            
+            user.job_title_id = job_title_id
+            # Update legacy job_title string from the job_title object
+            user.job_title = job_title.name
+            # Auto-set role based on job title ONLY if job_title has is_manager=True
+            # Don't override ADMIN role
+            if job_title.is_manager and user.role != UserRole.ADMIN:
+                user.role = UserRole.MANAGER
+
+    if "birth_date" in data:
+        parsed_birth_date = parse_birth_date(data.get("birth_date"))
+        if parsed_birth_date == "__invalid__":
+            return jsonify({"msg": "birth_date phai dung dinh dang YYYY-MM-DD"}), 400
+        user.birth_date = parsed_birth_date
+
     raw_role = data.get("role")
     if raw_role is not None:
         try:
-            u.role = UserRole.from_any(raw_role)
+            user.role = UserRole.from_any(raw_role)
         except ValueError:
-            return jsonify({"msg": f"Role không hợp lệ: {raw_role}"}), 400
-    u.org_unit_id = data.get("org_unit_id", u.org_unit_id)
-    if hasattr(u, "is_active") and "is_active" in data:
-        u.is_active = data.get("is_active", u.is_active)
+            return jsonify({"msg": f"Role khong hop le: {raw_role}"}), 400
+
+    if "org_unit_id" in data:
+        raw_org_unit_id = data.get("org_unit_id")
+        if raw_org_unit_id in (None, ""):
+            user.org_unit_id = None
+        else:
+            try:
+                org_unit_id = int(raw_org_unit_id)
+            except (TypeError, ValueError):
+                return jsonify({"msg": "org_unit_id khong hop le"}), 400
+            if not OrgUnit.query.get(org_unit_id):
+                return jsonify({"msg": "Don vi khong ton tai"}), 400
+            user.org_unit_id = org_unit_id
+
+    if hasattr(user, "is_active") and "is_active" in data:
+        user.is_active = data.get("is_active", user.is_active)
 
     if data.get("password"):
-        u.password_hash = generate_password_hash(data.get("password"))
+        user.password_hash = generate_password_hash(data.get("password"))
 
     try:
         db.session.commit()
     except DataError:
         db.session.rollback()
-        return jsonify({"msg": "Role khong tuong thich voi schema DB hien tai. Hay chay migration moi nhat."}), 400
-    return jsonify({"msg": "Cập nhật thành công"}), 200
+        return jsonify({"msg": "Du lieu khong hop le hoac khong tuong thich schema DB"}), 400
 
-# [DELETE] Xóa user
+    return jsonify({"msg": "Cap nhat thanh cong"}), 200
+
+
 @admin_users_bp.delete("/users/<int:user_id>")
 @admin_required
 def delete_user(user_id):
-    u = User.query.get_or_404(user_id)
-    db.session.delete(u)
+    user = User.query.get_or_404(user_id)
+    db.session.delete(user)
     db.session.commit()
-    return jsonify({"msg": "Đã xóa user"}), 200
+    return jsonify({"msg": "Da xoa user"}), 200
+
 
 @admin_users_bp.get("/org-units")
-@admin_required
+@jwt_required()
 def list_org_units():
     units = OrgUnit.query.order_by(OrgUnit.id.asc()).all()
     return jsonify([u.to_dict() for u in units]), 200
@@ -139,27 +204,21 @@ def create_org_unit():
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
     if not name:
-        return jsonify({"msg": "Thiếu tên đơn vị"}), 400
+        return jsonify({"msg": "Thieu ten don vi"}), 400
 
     parent_id = parse_parent_id(data)
-
-    # Nếu có parent_id thì parent phải tồn tại
-    if parent_id is not None:
-        parent = OrgUnit.query.get(parent_id)
-        if not parent:
-            return jsonify({"msg": "Đơn vị cha không tồn tại"}), 400
+    if parent_id is not None and not OrgUnit.query.get(parent_id):
+        return jsonify({"msg": "Don vi cha khong ton tai"}), 400
 
     new_unit = OrgUnit(
         name=name,
         parent_id=parent_id,
         unit_type="team" if parent_id is not None else "department",
-        is_active=True
+        is_active=True,
     )
 
     db.session.add(new_unit)
     db.session.commit()
-
-    # ✅ trả record vừa tạo
     return jsonify(new_unit.to_dict()), 201
 
 
@@ -172,21 +231,15 @@ def update_org_unit(id):
     if "name" in data:
         name = (data.get("name") or "").strip()
         if not name:
-            return jsonify({"msg": "Tên đơn vị không hợp lệ"}), 400
+            return jsonify({"msg": "Ten don vi khong hop le"}), 400
         unit.name = name
 
     if "parent_id" in data:
         parent_id = parse_parent_id(data)
-
-        # không cho tự trỏ chính nó
         if parent_id == unit.id:
-            return jsonify({"msg": "parent_id không hợp lệ"}), 400
-
-        if parent_id is not None:
-            parent = OrgUnit.query.get(parent_id)
-            if not parent:
-                return jsonify({"msg": "Đơn vị cha không tồn tại"}), 400
-
+            return jsonify({"msg": "parent_id khong hop le"}), 400
+        if parent_id is not None and not OrgUnit.query.get(parent_id):
+            return jsonify({"msg": "Don vi cha khong ton tai"}), 400
         unit.parent_id = parent_id
         unit.unit_type = "team" if parent_id is not None else "department"
 
@@ -201,11 +254,9 @@ def update_org_unit(id):
 @admin_required
 def delete_org_unit(id):
     unit = OrgUnit.query.get_or_404(id)
-
-    # ✅ chặn xóa nếu còn tổ con
     if OrgUnit.query.filter_by(parent_id=unit.id).count() > 0:
-        return jsonify({"msg": "Không thể xóa: đơn vị đang có tổ con"}), 400
+        return jsonify({"msg": "Khong the xoa: don vi dang co to con"}), 400
 
     db.session.delete(unit)
     db.session.commit()
-    return jsonify({"msg": "Đã xóa"}), 200
+    return jsonify({"msg": "Da xoa"}), 200
